@@ -43,6 +43,7 @@
 - 能够适应变化和调整
 - 坚持不懈和自我激励
   
+
 软件是有思想的，不是拼凑的。
 
 现在放弃更多，将来才能得到更多。
@@ -293,3 +294,65 @@ Go的学习资料：
     - reviewer能力要大于或等于代码作者的能力
     - 为了让reviewer不敷衍，reviewer要负主要责任
     - 每个一两周最好做一次代码review
+
+
+### Day12
+C语言是的伟大和优雅在于，可以在高级语言特性上对各种底层进行微观控制：
+- 绝对信任程序员
+- 不会阻止程序员做任何底层的事情
+- 保持最简洁的特性
+- 保证最快速的运行，哪怕牺牲掉可移植性
+
+各种编程语言各有千秋，不能说那种语言一定好，需要根据使用场景做选择
+
+#### 函数式编程
+将运算过程表示为一系列嵌套的函数调用，而声明式编程使得函数无论在什么情况下，都会得到同样的结果
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func lower(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	for i, v := range s {
+		s[i] = strings.ToLower(v)
+	}
+	return s
+}
+
+func lowerFunc(s string) string {
+	return strings.ToLower(s)
+}
+
+func mapFunc(lowerFunc func(string) string, s []string) []string {
+	for i, v := range s {
+		s[i] = lowerFunc(v)
+	}
+	return s
+}
+
+func main() {
+	data := []string{"HI", "Hello", "WORLD"}
+	fmt.Println(lower(data))
+	fmt.Println(mapFunc(lowerFunc, data))
+}
+```
+
+左脑是线性思维，更容易陷入细节和倾向于具象化的思考，指令式编程需要使用的是左脑
+右脑富有想象力，是非线性化和宏观的，倾向于抽象化的思考，函数式编程，逻辑编程和声明式编程需要使用右脑
+
+命令式编程和声明式编程是编程的本质，任何语言都可以用
+
+#### 主要的编程范式特点和相关语言
+
+| 编程范式   | 描述                                             | 主要特性元素                                                 | 相关语言                       |
+| ---------- | ------------------------------------------------ | ------------------------------------------------------------ | ------------------------------ |
+| Imperative | 使用流程化语句和过程直接控制程序的运行和数据状态 | 直接赋值，常用数据结构，全局变量或局部变量，顺序化数据操作和迭代，以功能为主的模块化 | C,C++，Java，PHP，Python，Ruby |
+|            |                                                  |                                                              |                                |
+|            |                                                  |                                                              |                                |
+
