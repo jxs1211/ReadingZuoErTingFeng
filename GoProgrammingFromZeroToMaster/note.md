@@ -52,3 +52,63 @@ interface是Go语言中真正的“魔法”，是Go语言的一个创新设计�
 
 类型嵌套是垂直扩展，接口组合是水平扩展，各自独立而又组合实现了某种功能
 
+
+
+Go的设计者敏锐地把握了CPU向多核方向发展的这一趋势，在决定不再使用C++而去创建一门新语言的时候，果断将面向多核、原生内置并发支持作为新语言的设计原则之一。
+
+并发和并行
+并发是有关结构的，它是一种将一个程序分解成多个小片段并且每个小片段都可以独立执行的程序设计方法；并发程序的小片段之间一般存在通信联系并且通过通信相互协作。并行是有关执行的，它表示同时进行一些计算任务。
+并发是一种程序设计，他让并行成为可能
+并发可以充分利用多核，让不同的任务跑在不同的核上，提高利用率和效率，而并行及时在多核情况下，也无法支持
+
+搬书的并发方案 vs.搬书的并行方案(https://www.youtube.com/watch?v=oV9rvDllKEg)
+
+一个loadbalancer的例子(https://go.dev/talks/2012/waza.slide#1)
+
+程序构建慢；失控的依赖管理；开发人员使用编程语言的不同子集（比如C++支持多范式，这样有些人用OO，有些人用泛型）；代码可理解性差（代码可读性差、文档差等）；功能重复实现；升级更新消耗大；实现自动化工具难度高；版本问题；跨语言构建问题。
+
+在Go语言最初设计阶段就将解决工程问题作为Go的设计原则之一去考虑Go语法、工具链与标准库的设计
+
+比如Rob Pike就曾谈到，Go当初之所以没有使用Python那样的代码缩进而是选择了与C语言相同的大括号来表示程序结构，是因为他们经过调查发现，虽然Python的缩进结构在构建小规模程序时的确很方便，但是当代码库变得更大的时候，缩进式的结构非常容易出错。从工程的安全性和可靠性角度考虑，Go团队最终选择了大括号代码块结构。
+
+（3）工具链开发人员在做工程的过程中需要使用工具。而Go语言提供了十分全面、贴心的编程语言官方工具链，涵盖了编译、编辑、依赖获取、调试、测试、文档、性能剖析等的方方面面。
+构建和运行：go build/go run
+依赖包查看与获取：go list/go get/go mod xx
+编辑辅助格式化：go fmt/gofmt
+文档查看：go doc/godoc
+单元测试/基准测试/测试覆盖率：go test
+代码静态分析：go vet
+性能剖析与跟踪结果查看：go tool pprof/go tool trace
+升级到新Go版本API的辅助工具：go tool fix
+报告Go语言bug：go bug
+
+
+编程语言影响编程思维，或者说每种编程语言都有属于自己的原生编程思维
+
+#### standard project
+
+![image-20240207092830690](C:\Users\xjshen\AppData\Roaming\Typora\typora-user-images\image-20240207092830690.png)
+
+#### lib project
+
+![image-20240207093006924](C:\Users\xjshen\AppData\Roaming\Typora\typora-user-images\image-20240207093006924.png)
+
+带internal的Go库项目结构
+
+```
+$tree -F ./chapter2/sources/GoLibProj
+GoLibProj
+├── LICENSE
+├── Makefile
+├── README.md
+├── go.mod
+├── internal/
+│  ├── ilib1/
+│  └── ilib2/
+├── lib.go
+├── lib1/
+│  └── lib1.go
+└── lib2/
+      └── lib2.go
+```
+
