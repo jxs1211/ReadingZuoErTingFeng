@@ -1155,3 +1155,562 @@ ok     sources/testdata-demo2   0.006s
 小结
 
 在这一条中，我们了解到面向工程的Go语言对测试依赖的外部数据文件的存放位置进行了规范，统一使用testdata目录，开发人员可以采用将预期数据文件放在testdata下的方式为测试提供静态测试固件。而Go golden文件的惯用法实现了testdata目录下测试依赖的预期结果数据文件的数据采集与测试代码的融合。
+
+## 第44条 正确运用fake、stub和mock等辅助单元测试
+
+你不需要一个真实的数据库来满足运行单元测试的需求。
+
+对Go代码进行测试的过程中，除了会遇到上一条中所提到的测试代码对外部文件数据的依赖之外，还会经常面对被测代码对外部业务组件或服务的依赖。此外，越是接近业务层，被测代码对外部组件或服务依赖的可能性越大。比如：
+```
+被测代码需要连接外部Redis服务；
+被测代码依赖一个外部邮件服务器来发送电子邮件；
+被测代码需与外部数据库建立连接并进行数据操作；
+被测代码使用了某个外部RESTful服务。
+```
+在生产环境中为运行的业务代码提供其依赖的真实组件或服务是必不可少的，也是相对容易的。但是在开发测试环境中，我们无法像在生产环境中那样，为测试（尤其是单元测试）提供真实运行的外部依赖。这是因为测试（尤其是单元测试）运行在各类开发环境、持续集成或持续交付环境中，我们很难要求所有环境为运行测试而搭建统一版本、统一访问方式、统一行为控制以及保持返回数据一致的真实外部依赖组件或服务。反过来说，为被测对象建立依赖真实外部组件或服务的测试代码是十分不明智的，因为这种测试（尤指单元测试）运行失败的概率要远大于其运行成功的概率，失去了存在的意义。
+
+为了能让对此类被测代码的测试进行下去，我们需要为这些被测代码提供其依赖的外部组件或服务的替身，如图44-1所示。
+
+```
+<!-- production -->
+biz code ---> external component or service
+<!-- test environment -->
+biz code ---> fake external component or service
+```
+显然用于代码测试的“替身”不必与真实组件或服务完全相同，替身只需要提供与真实组件或服务相同的接口，只要被测代码认为它是真实的即可。
+
+替身的概念是在测试驱动编程[1]理论中被提出的。作为测试驱动编程理论的最佳实践，xUnit家族框架将替身的概念在单元测试中应用得淋漓尽致，并总结出多种替身，比如fake、stub、mock等。这些概念及其应用模式被汇集在xUnit Test Patterns[2]一书中，该书已成为试驱动开发和xUnit框架拥趸人手一册的“圣经”。
+
+在本条中，我们就来一起看一下如何将xUnit最佳实践中的fake、stub和mock等概念应用到Go语言单元测试中以简化测试（区别于直接为被测代码建立其依赖的真实外部组件或服务），以及这些概念是如何促进被测代码重构以提升可测试性的。
+
+不过fake、stub、mock等替身概念之间并非泾渭分明的，理解这些概念并清晰区分它们本身就是一道门槛。本条尽量不涉及这些概念间的交集以避免讲解过于琐碎。想要深入了解这些概念间差别的读者可以自行精读xUnit Test Patterns。
+
+```
+[1]https://www.agilealliance.org/glossary/tdd
+[2]https://book.douban.com/subject/1859393
+```
+
+### 44.1　fake：真实组件或服务的简化实现版替身
+
+fake这个单词的中文含义是“伪造的”“假的”“伪装的”等。在这里，fake测试就是指采用真实组件或服务的简化版实现作为替身，以满足被测代码的外部依赖需求。比如：当被测代码需要连接数据库进行相关操作时，虽然我们在开发测试环境中无法提供一个真实的关系数据库来满足测试需求，但是可以基于哈希表实现一个内存版数据库来满足测试代码要求，我们用这样一个伪数据库作为真实数据库的替身，使得测试顺利进行下去。
+
+Go标准库中的$GOROOT/src/database/sql/fakedb_test.go就是一个sql.Driver接口的简化版实现，它可以用来打开一个基于内存的数据库（sql.fakeDB）的连接并操作该内存数据库：
+
+```go
+// $GOROOT/src/database/sql/fakedb_test.go
+...
+type fakeDriver struct {
+    mu         sync.Mutex
+    openCount  int
+    closeCount int
+    waitCh     chan struct{}
+    waitingCh  chan struct{}
+    dbs        map[string]*fakeDB
+}
+...
+var fdriver driver.Driver = &fakeDriver{}
+func init() {
+    Register("test", fdriver) //将自己作为driver进行了注册
+}
+...
+```
+在sql_test.go中，标准库利用上面的fakeDriver进行相关测试：
+```go
+// $GOROOT/src/database/sql/sql_test.go
+func TestUnsupportedOptions(t *testing.T) {
+    db := newTestDB(t, "people")
+    defer closeDB(t, db)
+    _, err := db.BeginTx(context.Background(), &TxOptions{
+        Isolation: LevelSerializable, ReadOnly: true,
+    })
+    if err == nil {
+        t.Fatal("expected error when using unsupported options, got nil")
+    }
+}
+
+const fakeDBName = "foo"
+
+func newTestDB(t testing.TB, name string) *DB {
+    return newTestDBConnector(t, &fakeConnector{name: fakeDBName}, name)
+}
+
+func newTestDBConnector(t testing.TB, fc *fakeConnector, name string) *DB {
+    fc.name = fakeDBName
+    db := OpenDB(fc)
+    if _, err := db.Exec("WIPE"); err != nil {
+        t.Fatalf("exec wipe: %v", err)
+    }
+    if name == "people" {
+        exec(t, db, "CREATE|people|name=string,age=int32,photo=blob,dead=bool,
+            bdate=datetime")
+        exec(t, db, "INSERT|people|name=Alice,age=?,photo=APHOTO", 1)
+        exec(t, db, "INSERT|people|name=Bob,age=?,photo=BPHOTO", 2)
+        exec(t, db, "INSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?", 3, chrisBirthday)
+    }
+    if name == "magicquery" {
+        exec(t, db, "CREATE|magicquery|op=string,millis=int32")
+        exec(t, db, "INSERT|magicquery|op=sleep,millis=10")
+    }
+    return db
+}
+```
+标准库中fakeDriver的这个简化版实现还是比较复杂，我们再来看一个自定义的简单例子来进一步理解fake的概念及其在Go单元测试中的应用。
+
+在这个例子中，被测代码为包mailclient中结构体类型mailClient的方法：ComposeAndSend：
+```go
+// chapter8/sources/faketest1/mailclient.go
+
+type mailClient struct {
+    mlr mailer.Mailer
+}
+
+func New(mlr mailer.Mailer) *mailClient {
+    return &mailClient{
+        mlr: mlr,
+    }
+}
+
+// 被测方法
+func (c *mailClient) ComposeAndSend(subject string,
+    destinations []string, body string) (string, error) {
+    signTxt := sign.Get()
+    newBody := body + "\n" + signTxt
+
+    for _, dest := range destinations {
+        err := c.mlr.SendMail(subject, dest, newBody)
+        if err != nil {
+            return "", err
+        }
+    }
+    return newBody, nil
+}
+```
+可以看到在创建mailClient实例的时候，需要传入一个mailer.Mailer接口变量，该接口定义如下：
+```go
+// chapter8/sources/faketest1/mailer/mailer.go
+type Mailer interface {
+    SendMail(subject, destination, body string) error
+}
+```
+ComposeAndSend方法将传入的电子邮件内容（body）与签名（signTxt）编排合并后传给Mailer接口实现者的SendMail方法，由其将邮件发送出去。在生产环境中，mailer.Mailer接口的实现者是要与远程邮件服务器建立连接并通过特定的电子邮件协议（如SMTP）将邮件内容发送出去的。但在单元测试中，我们无法满足被测代码的这个要求，于是我们为mailClient实例提供了两个简化版的实现：fakeOkMailer和fakeFailMailer，前者代表发送成功，后者代表发送失败。代码如下：
+```go
+// chapter8/sources/faketest1/mailclient_test.go
+type fakeOkMailer struct{}
+func (m *fakeOkMailer) SendMail(subject string, dest string, body string) error {
+    return nil
+}
+
+type fakeFailMailer struct{}
+func (m *fakeFailMailer) SendMail(subject string, dest string, body string) error {
+    return fmt.Errorf("can not reach the mail server of dest [%s]", dest)
+}
+```
+下面就是这两个替身在测试中的使用方法：
+```go
+// chapter8/sources/faketest1/mailclient_test.go
+func TestComposeAndSendOk(t *testing.T) {
+    m := &fakeOkMailer{}
+    mc := mailclient.New(m)
+    _, err := mc.ComposeAndSend("hello, fake test", []string{"xxx@example.com"}, "the test body")
+    if err != nil {
+        t.Errorf("want nil, got %v", err)
+    }
+}
+
+func TestComposeAndSendFail(t *testing.T) {
+    m := &fakeFailMailer{}
+    mc := mailclient.New(m)
+    _, err := mc.ComposeAndSend("hello, fake test", []string{"xxx@example.com"}, "the test body")
+    if err == nil {
+        t.Errorf("want non-nil, got nil")
+    }
+}
+```
+我们看到这个测试中mailer.Mailer的fake实现的确很简单，简单到只有一个返回语句。但就这样一个极其简化的实现却满足了对ComposeAndSend方法进行测试的所有需求。
+
+使用fake替身进行测试的最常见理由是在测试环境无法构造被测代码所依赖的外部组件或服务，或者这些组件/服务有副作用。fake替身的实现也有两个极端：要么像标准库fakedb_test.go那样实现一个全功能的简化版内存数据库driver，要么像faketest1例子中那样针对被测代码的调用请求仅返回硬编码的成功或失败。这两种极端实现有一个共同点：并不具备在测试前对返回结果进行预设置的能力。这也是上面例子中我们针对成功和失败两个用例分别实现了一个替身的原因。（如果非要说成功和失败也是预设置的，那么fake替身的预设置能力也仅限于设置单一的返回值，即无论调用多少次，传入什么参数，返回值都是一个。）
+
+### 44.2　stub：对返回结果有一定预设控制能力的替身
+
+stub也是一种替身概念，和fake替身相比，stub替身增强了对替身返回结果的间接控制能力，这种控制可以通过测试前对调用结果预设置来实现。不过，stub替身通常仅针对计划之内的结果进行设置，对计划之外的请求也无能为力。
+
+使用Go标准库net/http/httptest实现的用于测试的Web服务就可以作为一些被测对象所依赖外部服务的stub替身。下面就来看一个这样的例子。
+
+该例子的被测代码为一个获取城市天气的客户端，它通过一个外部的天气服务来获得城市天气数据：
+```go
+// chapter8/sources/stubtest1/weather_cli.go
+type Weather struct {
+    City    string `json:"city"`
+    Date    string `json:"date"`
+    TemP    string `json:"temP"`
+    Weather string `json:"weather"`
+}
+
+func GetWeatherInfo(addr string, city string) (*Weather, error) {
+    url := fmt.Sprintf("%s/weather?city=%s", addr, city)
+    resp, err := http.Get(url)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("http status code is %d", resp.StatusCode)
+    }
+
+    body, err := ioutil.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+
+    var w Weather
+    err = json.Unmarshal(body, &w)
+    if err != nil {
+        return nil, err
+    }
+
+    return &w, nil
+}
+```
+下面是针对GetWeatherInfo函数的测试代码：
+```go
+// chapter8/sources/stubtest1/weather_cli_test.go
+var weatherResp = []Weather{
+    {
+        City:    "nanning",
+        TemP:    "26~33",
+        Weather: "rain",
+        Date:    "05-04",
+    },
+    {
+        City:    "guiyang",
+        TemP:    "25~29",
+        Weather: "sunny",
+        Date:    "05-04",
+    },
+    {
+        City:    "tianjin",
+        TemP:    "20~31",
+        Weather: "windy",
+        Date:    "05-04",
+    },
+}
+
+func TestGetWeatherInfoOK(t *testing.T) {
+    ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,
+        r *http.Request) {
+        var data []byte
+
+        if r.URL.EscapedPath() != "/weather" {
+            w.WriteHeader(http.StatusForbidden)
+        }
+
+        r.ParseForm()
+        city := r.Form.Get("city")
+        if city == "guiyang" {
+            data, _ = json.Marshal(&weatherResp[1])
+        }
+        if city == "tianjin" {
+            data, _ = json.Marshal(&weatherResp[2])
+        }
+        if city == "nanning" {
+            data, _ = json.Marshal(&weatherResp[0])
+        }
+
+        w.Write(data)
+    }))
+    defer ts.Close()
+    addr := ts.URL
+    city := "guiyang"
+    w, err := GetWeatherInfo(addr, city)
+    if err != nil {
+        t.Fatalf("want nil, got %v", err)
+    }
+    if w.City != city {
+        t.Errorf("want %s, got %s", city, w.City)
+    }
+    if w.Weather != "sunny" {
+        t.Errorf("want %s, got %s", "sunny", w.City)
+    }
+}
+```
+在上面的测试代码中，我们使用httptest建立了一个天气服务器替身，被测函数GetWeatherInfo被传入这个构造的替身天气服务器的服务地址，其对外部服务的依赖需求被满足。同时，我们看到该替身具备一定的对服务返回应答结果的控制能力，这种控制通过测试前对返回结果的预设置实现（上面例子中设置了三个城市的天气信息结果）。这种能力可以实现对测试结果判断的控制。
+
+接下来，回到mailclient的例子。之前的示例只聚焦于对Send的测试，而忽略了对Compose的测试。如果要验证邮件内容编排得是否正确，就需要对ComposeAndSend方法的返回结果进行验证。但这里存在一个问题，那就是ComposeAndSend依赖的签名获取方法sign.Get中返回的时间签名是当前时间，这对于测试代码来说就是一个不确定的值，这也直接导致ComposeAndSend的第一个返回值的内容是不确定的。这样一来，我们就无法对Compose部分进行测试。要想让其具备可测性，我们需要对被测代码进行局部重构：可以抽象出一个Signer接口（这样就需要修改创建mailClient的New函数），当然也可以像下面这样提取一个包级函数类型变量（考虑到演示的方便性，这里使用了此种方法，但不代表它比抽象出接口的方法更优）：
+```go
+// chapter8/sources/stubtest2/mailclient.go
+var getSign = sign.Get // 提取一个包级函数类型变量
+func (c *mailClient) ComposeAndSend(subject, sender string, destinations []string, body string) (string, error) {
+    signTxt := getSign(sender)
+    newBody := body + "\n" + signTxt
+
+    for _, dest := range destinations {
+        err := c.mlr.SendMail(subject, sender, dest, newBody)
+        if err != nil {
+            return "", err
+        }
+    }
+    return newBody, nil
+}
+```
+我们看到新版mailclient.go提取了一个名为getSign的函数类型变量，其默认值为sign包的Get函数。同时，为了演示，我们顺便更新了ComposeAndSend的参数列表以及mailer的接口定义，并增加了一个sender参数：
+```go
+// chapter8/sources/stubtest2/mailer/mailer.go
+type Mailer interface {
+    SendMail(subject, sender, destination, body string) error
+}
+```
+由于getSign的存在，我们就可以在测试代码中为签名获取函数（sign.Get）建立stub替身了。
+```go
+// chapter8/sources/stubtest2/mailclient_test.go
+var senderSigns = map[string]string{
+    "tonybai@example.com":  "I'm a go programmer",
+    "jimxu@example.com":    "I'm a java programmer",
+    "stevenli@example.com": "I'm a object-c programmer",
+}
+func TestComposeAndSendWithSign(t *testing.T) {
+    old := getSign
+    sender := "tonybai@example.com"
+    timestamp := "Mon, 04 May 2020 11:46:12 CST"
+
+    getSign = func(sender string) string {
+        selfSignTxt := senderSigns[sender]
+        return selfSignTxt + "\n" + timestamp
+    }
+
+    defer func() {
+        getSign = old //测试完毕后，恢复原值
+    }()
+
+    m := &fakeOkMailer{}
+    mc := New(m)
+    body, err := mc.ComposeAndSend("hello, stub test", sender,
+        []string{"xxx@example.com"}, "the test body")
+    if err != nil {
+        t.Errorf("want nil, got %v", err)
+    }
+
+    if !strings.Contains(body, timestamp) {
+        t.Errorf("the sign of the mail does not contain [%s]", timestamp)
+    }
+
+    if !strings.Contains(body, senderSigns[sender]) {
+        t.Errorf("the sign of the mail does not contain [%s]", senderSigns [sender])
+    }
+
+    sender = "jimxu@example.com"
+    body, err = mc.ComposeAndSend("hello, stub test", sender,
+           []string{"xxx@example.com"}, "the test body")
+    if err != nil {
+        t.Errorf("want nil, got %v", err)
+    }
+
+    if !strings.Contains(body, senderSigns[sender]) {
+        t.Errorf("the sign of the mail does not contain [%s]", senderSigns [sender])
+    }
+}
+```
+在新版mailclient_test.go中，我们使用自定义的匿名函数替换了getSign原先的值（通过defer在测试执行后恢复原值）。在新定义的匿名函数中，我们根据传入的sender选择对应的个人签名，并将其与预定义的时间戳组合在一起返回给ComposeAndSend方法。
+
+在这个例子中，我们预置了三个Sender的个人签名，即以这三位sender对ComposeAndSend发起请求，返回的结果都在stub替身的控制范围之内。
+
+在GitHub上有一个名为[gostub](https://github.com/prashantv/gostub)的第三方包可以用于简化stub替身的管理和编写。以上面的例子为例，如果改写为使用gostub的测试，代码如下：
+```go
+// chapter8/sources/stubtest3/mailclient_test.go
+func TestComposeAndSendWithSign(t *testing.T) {
+    sender := "tonybai@example.com"
+    timestamp := "Mon, 04 May 2020 11:46:12 CST"
+
+    stubs := gostub.Stub(&getSign, func(sender string) string {
+        selfSignTxt := senderSigns[sender]
+        return selfSignTxt + "\n" + timestamp
+    })
+    defer stubs.Reset()
+    ...
+}
+```
+
+### 44.3　mock：专用于行为观察和验证的替身
+和fake、stub替身相比，mock替身更为强大：它除了能提供测试前的预设置返回结果能力之外，还可以对mock替身对象在测试过程中的行为进行观察和验证。不过相比于前两种替身形式，mock存在应用局限（尤指在Go中）。
+```
+和前两种替身相比，mock的应用范围要窄很多，只用于实现某接口的实现类型的替身。一般需要通过第三方框架实现mock替身。Go官方维护了一个mock框架——gomock（https://github.com/golang/mock），该框架通过代码生成的方式生成实现某接口的替身类型。
+```
+mock这个概念相对难于理解，我们通过例子来直观感受一下：将上面例子中的fake替身换为mock替身。首先安装Go官方维护的gomock框架。这个框架分两部分：一部分是用于生成mock替身的mockgen二进制程序，另一部分则是生成的代码所要使用的gomock包。先来安装一下mockgen：
+```sh
+$go get github.com/golang/mock/mockgen
+```
+通过上述命令，可将mockgen安装到$GOPATH/bin目录下（确保该目录已配置在PATH环境变量中）。
+
+接下来，改造一下mocktest/mailer/mailer.go源码。在源码文件开始处加入go generate命令指示符：
+
+```go
+// chapter8/sources/mocktest/mailer/mailer.go
+//go:generate mockgen -source=./mailer.go -destination=./mock_mailer.go -package=mailer Mailer
+
+package mailer
+
+type Mailer interface {
+    SendMail(subject, sender, destination, body string) error
+}
+```
+接下来，在mocktest目录下，执行go generate命令以生成mailer.Mailer接口实现的替身。执行完go generate命令后，我们会在mocktest/mailer目录下看到一个新文件——mock_mailer.go：
+```go
+// chapter8/sources/mocktest/mailer/mock_mailer.go
+
+// Code generated by MockGen. DO NOT EDIT.
+// Source: ./mailer.go
+
+// mailer包是一个自动生成的 GoMock包
+package mailer
+
+import (
+    gomock "github.com/golang/mock/gomock"
+    reflect "reflect"
+)
+
+// MockMailer是Mailer接口的一个模拟实现
+type MockMailer struct {
+    ctrl     *gomock.Controller
+    recorder *MockMailerMockRecorder
+}
+
+// MockMailerMockRecorder 是 MockMailer的模拟recorder
+type MockMailerMockRecorder struct {
+    mock *MockMailer
+}
+
+// NewMockMailer创建一个新的模拟实例
+func NewMockMailer(ctrl *gomock.Controller) *MockMailer {
+    mock := &MockMailer{ctrl: ctrl}
+    mock.recorder = &MockMailerMockRecorder{mock}
+    return mock
+}
+
+// EXPECT返回一个对象，允许调用者指示预期的使用情况
+func (m *MockMailer) EXPECT() *MockMailerMockRecorder {
+    return m.recorder
+}
+
+// SendMail模拟基本方法
+func (m *MockMailer) SendMail(subject, sender, destination, body string) error {
+    m.ctrl.T.Helper()
+    ret := m.ctrl.Call(m, "SendMail", subject, sender, destination, body)
+    ret0, _ := ret[0].(error)
+    return ret0
+}
+
+// SendMail表示预期的对SendMail的调用
+func (mr *MockMailerMockRecorder) SendMail(subject, sender, destination, body interface{}) *gomock.Call {
+    mr.mock.ctrl.T.Helper()
+    return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendMail", reflect.TypeOf((*MockMailer)(nil).SendMail), subject, sender, destination, body)
+}
+```
+有了替身之后，我们就以将其用于对ComposeAndSend方法的测试了。下面是使用了mock替身的mailclient_test.go：
+```go
+// chapter8/sources/mocktest/mocktest/mailclient_test.go
+package mailclient
+
+import (
+    "errors"
+    "testing"
+
+    "github.com/bigwhite/mailclient/mailer"
+    "github.com/golang/mock/gomock"
+)
+
+var senderSigns = map[string]string{
+    "tonybai@example.com":  "I'm a go programmer",
+    "jimxu@example.com":    "I'm a java programmer",
+    "stevenli@example.com": "I'm a object-c programmer",
+}
+
+func TestComposeAndSendOk(t *testing.T) {
+    old := getSign
+    sender := "tonybai@example.com"
+    timestamp := "Mon, 04 May 2020 11:46:12 CST"
+
+    getSign = func(sender string) string {
+        selfSignTxt := senderSigns[sender]
+        return selfSignTxt + "\n" + timestamp
+    }
+    defer func() {
+        getSign = old //测试完毕后，恢复原值
+    }()
+
+    mockCtrl := gomock.NewController(t)
+    defer mockCtrl.Finish() //Go 1.14及之后版本中无须调用该Finish
+
+    mockMailer := mailer.NewMockMailer(mockCtrl)
+    mockMailer.EXPECT().SendMail("hello, mock test", sender,
+     "dest1@example.com",
+     "the test body\n"+senderSigns[sender]+"\n"+timestamp).Return(nil).Times(1)
+    mockMailer.EXPECT().SendMail("hello, mock test", sender,
+     "dest2@example.com",
+     "the test body\n"+senderSigns[sender]+"\n"+timestamp).Return(nil).Times(1)
+
+    mc := New(mockMailer)
+    _, err := mc.ComposeAndSend("hello, mock test",
+      sender, []string{"dest1@example.com", "dest2@example.com"}, "the test body")
+    if err != nil {
+        t.Errorf("want nil, got %v", err)
+    }
+}
+...
+```
+上面这段代码的重点在于下面这几行：
+```go
+mockMailer.EXPECT().SendMail("hello, mock test", sender,
+    "dest1@example.com",
+    "the test body\n"+senderSigns[sender]+"\n"+timestamp).Return(nil).Times(1)
+```
+这就是前面提到的mock替身具备的能力：在测试前对预期返回结果进行设置（这里设置SendMail返回nil），对替身在测试过程中的行为进行验证。Times(1)意味着以该参数列表调用的SendMail方法在测试过程中仅被调用一次，多一次调用或没有调用均会导致测试失败。这种对替身观察和验证的能力是mock区别于stub的重要特征。
+
+gomock是一个通用的mock框架，社区还有一些专用的mock框架可用于快速创建mock替身，比如：[go-sqlmock](https://github.com/DATA-DOG/go-sqlmock)专门用于创建sql/driver包中的Driver接口实现的mock替身，可以帮助Gopher简单、快速地建立起对数据库操作相关方法的单元测试。
+
+小结
+
+本条介绍了当被测代码对外部组件或服务有强依赖时可以采用的测试方案，这些方案采用了相同的思路：为这些被依赖的外部组件或服务建立替身。这里介绍了三类替身以及它们的适用场合与注意事项。
+
+本条要点如下。
+
+fake、stub、mock等替身概念之间并非泾渭分明的，对这些概念的理解容易混淆。比如标准库net/http/transfer_test.go文件中的mockTransferWriter类型，虽然其名字中带有mock，但实质上它更像是一个fake替身。
+
+我们更多在包内测试应用上述替身概念辅助测试，这就意味着此类测试与被测代码是实现级别耦合的，这样的测试健壮性较差，一旦被测代码内部逻辑有变化，测试极容易失败。通过fake、stub、mock等概念实现的替身参与的测试毕竟是在一个虚拟的“沙箱”环境中，不能代替与真实依赖连接的测试，因此，在集成测试或系统测试等使用真实外部组件或服务的测试阶段，务必包含与真实依赖的联测用例。
+
+```
+fake替身主要用于被测代码依赖组件或服务的简化实现。
+stub替身具有有限范围的、在测试前预置返回结果的控制能力。
+mock替身则专用于对替身的行为进行观察和验证的测试，一般用作Go接口类型的实现的替身。
+```
+
+## 第45条 使用模糊测试让潜在bug无处遁形
+
+在Go 1.5版本发布的同时，前英特尔黑带级工程师、现谷歌工程师Dmitry Vyukov发布了Go语言模糊测试工具go-fuzz。在GopherCon 2015技术大会上，Dmitry Vyukov在其名为“GoDynamic Tools”的主题演讲中着重介绍了go-fuzz。
+
+对于模糊测试（fuzz testing），想必很多Gopher比较陌生，当初笔者也不例外，至少在接触go-fuzz之前，笔者从未在Go或其他编程语言中使用过类似的测试工具。根据维基百科的定义，模糊测试就是指半自动或自动地为程序提供非法的、非预期、随机的数据，并监控程序在这些输入数据下是否会出现崩溃、内置断言失败、内存泄露、安全漏洞等情况（见图45-1）。
+
+模糊测试始于1988年Barton Miller所做的一项有关Unix随机测试的项目。到目前为止，已经有许多有关模糊测试的理论支撑，并且越来越多的编程语言开始提供对模糊测试的支持，比如在编译器层面原生提供模糊测试支持的LLVM fuzzer项目libfuzzer、历史最悠久的面向安全的fuzzer方案afl-fuzz、谷歌开源的面向可伸缩模糊测试基础设施的ClusterFuzz等。
+
+传统软件测试技术越来越无法满足现代软件日益增长的规模、复杂性以及对开发速度的要求。传统软件测试一般会针对被测目标的特性进行人工测试设计。在设计一些异常测试用例的时候，测试用例质量好坏往往取决于测试设计人员对被测系统的理解程度及其个人能力。即便测试设计人员个人能力很强，对被测系统也有较深入的理解，他也很难在有限的时间内想到所有可能的异常组合和异常输入，尤其是面对庞大的分布式系统的时候。系统涉及的自身服务组件、中间件、第三方系统等多且复杂，这些系统中的潜在bug或者组合后形成的潜在bug是我们无法预知的。而将随机测试、边界测试、试探性攻击等测试技术集于一身的模糊测试对于上述传统测试技术存在的问题是一个很好的补充和解决方案。
+
+在本条中，我们就来看看如何在Go中为被测代码建立起模糊测试，让那些潜在bug无处遁形。
+
+### 45.1　模糊测试在挖掘Go代码的潜在bug中的作用
+
+go-fuzz工具让Gopher具备了在Go语言中为被测代码建立模糊测试的条件。但模糊测试在挖掘Go代码中潜在bug中的作用究竟有多大呢？我们可以从Dmitry Vyukov提供的一组数据中看出来。
+
+Dmitry Vyukov使用go-fuzz对当时（2015年）的Go标准库以及其他第三方开源库进行了模糊测试并取得了惊人的战果：
+
+```sh
+// 60个测试
+60 tests
+
+// 在Go标准库中发现137个bug(70个已经修复)
+137 bugs in std lib (70 fixed)
+
+// 在其他项目中发现165个bug
+165 elsewhere (47 in gccgo, 30 in golang.org/x, 42 in freetype-go, protobuf, http2,
+    bson)
+```
+go-fuzz的战绩在持续扩大，截至本书写作时，列在go-fuzz官方站点上的、由广大Gopher分享出来的已发现bug已有近400个，未分享出来的通过go-fuzz发现的bug估计远远不止这个数量。
+
