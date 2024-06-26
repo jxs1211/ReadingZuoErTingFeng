@@ -1714,3 +1714,1059 @@ Dmitry Vyukov使用go-fuzz对当时（2015年）的Go标准库以及其他第三
 ```
 go-fuzz的战绩在持续扩大，截至本书写作时，列在go-fuzz官方站点上的、由广大Gopher分享出来的已发现bug已有近400个，未分享出来的通过go-fuzz发现的bug估计远远不止这个数量。
 
+### 45.2　go-fuzz的初步工作原理
+
+go-fuzz实际上是基于前面提到的老牌模糊测试项目afl-fuzz的逻辑设计和实现的。不同的是在使用的时候，afl-fuzz对于每个输入用例（input case）都会创建（fork）一个进程（process）去执行，而go-fuzz则是将输入用例中的数据传给下面这样一个Fuzz函数，这样就无须反复重启程序。
+
+```go
+func Fuzz(data []byte) int
+```
+go-fuzz进一步完善了Go开发测试工具集，很多较早接受Go语言的公司（如Cloudflare等）已经开始使用go-fuzz来测试自己的产品以提高产品质量了。
+
+go-fuzz的工作流程如下：
+
+1）生成随机数据；
+
+2）将上述数据作为输入传递给被测程序；
+
+3）观察是否有崩溃记录（crash），如果发现崩溃记录，则说明找到了潜在的bug。
+
+之后开发者可以根据crash记录情况去确认和修复bug。修复bug后，我们一般会为被测代码添加针对这个bug的单元测试用例以验证bug已经修复。
+
+go-fuzz采用的是代码覆盖率引导的fuzzing算法（Coverage-guided fuzzing）。go-fuzz运行起来后将进入一个死循环，该循环中的逻辑的伪代码大致如下：
+
+```go
+// go-fuzz-build在构建用于go-fuzz的二进制文件(*.zip)的过程中
+// 在被测对象代码中埋入用于统计代码覆盖率的桩代码及其他信息
+Instrument program for code coverage
+
+Collect initial corpus of inputs  // 收集初始输入数据语料(位于工作路径下的corpus目录下)
+for {
+    // 从corpus中读取语料并做随机变化
+    Randomly mutate an input from the corpus
+
+    // 执行Fuzz，收集代码覆盖率数据
+    Execute and collect coverage
+
+    // 如果输入数据提供了新的代码覆盖率，则将该输入数据存入语料库(corpus)
+    If the input gives new coverage, add it to corpus
+}
+```
+
+go-fuzz的核心是对语料库的输入数据如何进行变化。go-fuzz内部使用两种对语料库的输入数据进行变化的方法：突变（mutation）和改写（versify）。突变是一种低级方法，主要是对语料库的字节进行小修改。下面是一些常见的突变策略：
+
+```
+插入/删除/重复/复制随机范围的随机字节；
+位翻转；
+交换2字节；
+将一个字节设置为随机值；
+从一个byte/uint16/uint32/uint64中添加/减去；
+将一个byte/uint16/uint32替换为另一个值；
+将一个ASCII数字替换为另一个数字；
+拼接另一个输入；
+插入其他输入的一部分；
+插入字符串/整数字面值；
+替换为字符串/整数字面值。
+```
+例如，下面是对输入语料采用突变方法的输入数据演进序列：
+```
+""
+"", "A"
+"", "A", "AB"
+"", "A", "AB", "ABC"
+"", "A", "AB", "ABC", "ABCD"
+```
+改写是比较先进的高级方法，它会学习文本的结构，对输入进行简单分析，识别出输入语料数据中各个部分的类型，比如数字、字母数字、列表、引用等，然后针对不同部分运用突变策略。 下面是应用改写方法进行语料处理的例子：
+
+原始语料输入：
+```xml
+`<item name="foo"><prop name="price">100</prop></item>`
+```
+运用改写方法后的输入数据例子：
+```xml
+<item name="rb54ana"><item name="foo"><prop name="price"></prop><prop/></item>
+    </item>
+<item name=""><prop name="price">=</prop><prop/> </item>
+<item name=""><prop F="">-026023767521520230564132665e0333302100</prop><prop/>
+    </item>
+<item SN="foo_P"><prop name="_G_nx">510</prop><prop name="vC">-9e-07036514
+    </prop></item>
+<item name="foo"><prop name="c8">prop name="p"</prop>/}<prop name=" price">01e-6
+    </prop></item>
+<item name="foo"><item name="foo"><prop JY="">100</prop></item>8<prop/></item>
+```
+
+### 45.3　go-fuzz使用方法
+
+#### 1. 安装go-fuzz
+使用go-fuzz需要安装两个重要工具：go-fuzz-build和go-fuzz。通过标准go get就可以安装它们：
+
+```go
+$ go get github.com/dvyukov/go-fuzz/go-fuzz
+$ go get github.com/dvyukov/go-fuzz/go-fuzz-build
+```
+go get会自动将两个工具安装到$GOROOT/bin或$GOPATH/bin下，因此你需要确保你的Path环境变量下包含这两个路径。
+
+#### 2. 带有模糊测试的项目组织
+假设待测试的Go包名为foo，包源文件路径为$GOPATH/src/github.com/bigwhite/fuzzexamples/foo。为了应用go-fuzz为包foo建立模糊测试，我们一般会在foo下创建fuzz.go源文件，其内容模板如下：
+```go
+// +build gofuzz
+
+package foo
+
+func Fuzz(data []byte) int {
+    ...
+}
+```
+go-fuzz-build在构建用于go-fuzz命令输入的二进制文件时，会搜索带有“+build gofuzz”指示符的Go源文件以及其中的Fuzz函数。如果foo包下没有这样的文件，在执行go-fuzz-build时，你会得到类似如下的错误日志：
+```sh
+$go-fuzz-build github.com/bigwhite/fuzzexamples/foo
+failed to execute go build: exit status 2
+$go-fuzz-main
+/var/folders/2h/xr2tmnxx6qxc4w4w13m01fsh0000gn/T/go-fuzz-build641745751/src/go-fuzz-main/main.go:10: undefined: foo.Fuzz
+```
+有时候，待测试包的包内功能很多，一个Fuzz函数不够用，我们可以在fuzztest下建立多个目录来应对：
+```sh
+github.com/bigwhite/fuzzexamples/foo/fuzztest]$tree
+.
+├── fuzz1
+│   ├── corpus
+│   ├── fuzz.go
+│   └── gen
+│       └── main.go
+└── fuzz2
+    ├── corpus
+    ├── fuzz.go
+    └── gen
+        └── main.go
+ ...
+```
+其中的fuzz1, fuzz2, …, fuzzN各自为一个go-fuzz单元，如果要应用go-fuzz，则可像下面这样执行：
+```sh
+$ cd fuzz1
+$ go-fuzz-build github.com/bigwhite/fuzzexamples/foo/fuzztest/fuzz1
+$ go-fuzz -bin=./foo-fuzz.zip -workdir=./
+
+...
+
+$ cd fuzz2
+$ go-fuzz-build github.com/bigwhite/fuzzexamples/foo/fuzztest/fuzz2
+$ go-fuzz -bin=./foo-fuzz.zip -workdir=./
+```
+我们看到，在每个go-fuzz测试单元下有一套“固定”的目录组合。以fuzz1目录为例：
+```go
+├── fuzz1
+│   ├── corpus
+│   ├── fuzz.go
+│   └── gen
+│       └── main.go
+```
+其中：
+```
+corpus为存放输入数据语料的目录，在go-fuzz执行之前，可以放入初始语料；fuzz.go为包含Fuzz函数的源码文件；gen目录中包含手工生成初始语料的main.go代码。
+```
+在后续的示例中，我们会展示细节。
+#### 3. go-fuzz-build
+go-fuzz-build会根据Fuzz函数构建一个用于go-fuzz执行的zip包（PACKAGENAME-fuzz.zip），包里包含了用途不同的三个文件：
+```sh
+cover.exe metadata sonar.exe
+```
+按照go-fuzz作者的解释，这三个二进制程序的功能分别如下。
+```
+cover.exe：被注入了代码测试覆盖率桩设施的二进制文件。
+sonar.exe：被注入了sonar统计桩设施的二进制文件。
+metadata：包含代码覆盖率统计、sonar的元数据以及一些整型、字符串字面值。
+```
+
+不过作为使用者，我们不必过于关心它们，点到为止。
+
+#### 4. 执行go-fuzz
+
+一旦生成了foo-fuzz.zip，我们就可以执行针对fuzz1的模糊测试。
+
+```sh
+$cd fuzz1
+$go-fuzz -bin=./foo-fuzz.zip -workdir=./
+2019/12/08 17:51:48 workers: 4, corpus: 8 (1s ago), crashers: 0, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 3s
+2019/12/08 17:51:51 workers: 4, corpus: 9 (2s ago), crashers: 0, restarts: 1/3851, execs: 11553 (1924/sec), cover: 143, uptime: 6s
+2019/12/08 17:51:54 workers: 4, corpus: 9 (5s ago), crashers: 0, restarts: 1/3979, execs: 47756 (5305/sec), cover: 143, uptime: 9s
+...
+```
+如果corpus目录中没有初始语料数据，那么go-fuzz也会自行生成相关数据传递给Fuzz函数，并且采用遗传算法，不断基于corpus中的语料生成新的输入语料。go-fuzz作者建议corpus初始时放入的语料越多越好，而且要有足够的多样性，这样基于这些初始语料施展遗传算法，效果才会更佳。go-fuzz在执行过程中还会将一些新语料持久化成文件放在corpus中，以供下次模糊测试执行时使用。
+
+前面说过，go-fuzz执行时是一个无限循环，上面的测试需要手动停下来。go-fuzz会在指定的workdir中创建另两个目录：crashers和suppressions。顾名思义，crashers中存放的是代码崩溃时的相关信息，包括引起崩溃的输入用例的二进制数据、输入数据的字符串形式
+
+（xxx.quoted）以及基于这个数据的输出数据（xxx.output）。suppressions目录中则保存着崩溃时的栈跟踪信息，方便开发人员快速定位bug。
+
+#### 45.4　使用go-fuzz建立模糊测试的示例
+
+gocmpp（https://github.com/bigwhite/gocmpp）是一个中国移动cmpp短信协议库的Go实现，这里我们就用为该项目添加模糊测试作为示例。
+
+gocmpp中的每种协议包都实现了Packer接口，其中的Unpack尤其适合做模糊测试。由于协议包众多，我们在gocmpp下专门建立了fuzztest目录，用于存放模糊测试的代码，将各个协议包的模糊测试分到各个子目录中：
+
+```sh
+github.com/bigwhite/gocmpp/fuzztest$tree
+.
+├── fwd
+│   ├── corpus
+│   │   └── 0
+│   ├── fuzz.go
+│   └── gen
+│       └── main.go
+└── submit
+       ├── corpus
+       │   ├── 0
+       ├── fuzz.go
+       └── gen
+           └── main.go
+```
+先说说每个模糊测试单元（比如fwd或submit）下的gen/main.go，这是一个用于生成初始语料的可执行程序。以submit/gen/main.go为例：
+```go
+// submit/gen/main.go
+package main
+
+import (
+    "github.com/dvyukov/go-fuzz/gen"
+)
+
+func main() {
+    data := []byte{
+        0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00,
+        ...
+          0x6d, 0x00, 0x69, 0x00, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }
+
+    gen.Emit(data, nil, true)
+}
+```
+在这个main.go源文件中，我们借用submit包的单元测试中的数据作为模糊测试的初始语料数据，通过go-fuzz提供的gen包将数据输出到文件中：
+
+```sh
+$cd submit/gen
+$go run main.go -out ../corpus/
+$ls -l ../corpus/
+-rw-r--r--  1 tony  staff  181 12  7 22:00 0
+...
+```
+该程序在corpus目录下生成了一个名为“0”的文件作为submit包模糊测试的初始语料。
+
+接下来看看submit/fuzz.go：
+```go
+// +build gofuzz
+
+package cmppfuzz
+
+import (
+    "github.com/bigwhite/gocmpp"
+)
+
+func Fuzz(data []byte) int {
+    p := &cmpp.Cmpp2SubmitReqPkt{}
+    if err := p.Unpack(data); err != nil {
+        return 0
+    }
+    return 1
+}
+```
+这是最为简单的Fuzz函数实现了。根据作者对Fuzz的规约，Fuzz的返回值是有重要含义的：
+
+```
+如果此次输入的数据在某种程度上是很有意义的，go-fuzz会给予这类输入更高的优先级，Fuzz应该返回1；
+如果明确这些输入绝对不能放入corpus，那么让Fuzz返回-1；至于其他情况，则返回0。
+```
+接下来就该go-fuzz-build和go-fuzz登场了。这与前面的介绍差不多，我们先用go-fuzz-build构建go-fuzz使用的带有代码覆盖率统计桩代码的二进制文件：
+```sh
+$cd submit
+$go-fuzz-build github.com/bigwhite/gocmpp/fuzztest/submit
+$ls
+cmppfuzz-fuzz.zip    corpus/            fuzz.go            gen/
+```
+然后在submit目录下执行go-fuzz：
+```sh
+$go-fuzz -bin=./cmppfuzz-fuzz.zip -workdir=./
+2019/12/07 22:05:02 workers: 4, corpus: 1 (3s ago), crashers: 0, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 3s
+2019/12/07 22:05:05 workers: 4, corpus: 3 (0s ago), crashers: 0, restarts: 1/0, execs: 0 (0/sec), cover: 32, uptime: 6s
+2019/12/07 22:05:08 workers: 4, corpus: 7 (1s ago), crashers: 0, restarts: 1/5424, execs: 65098 (7231/sec), cover: 131, uptime: 9s
+2019/12/07 22:05:11 workers: 4, corpus: 9 (0s ago), crashers: 0, restarts: 1/5424, execs: 65098 (5424/sec), cover: 146, uptime: 12s
+...
+2019/12/07 22:09:11 workers: 4, corpus: 9 (4m0s ago), crashers: 0, restarts: 1/9860, execs: 4033002 (16002/sec), cover: 146, uptime: 4m12s
+^C2019/12/07 22:09:13 shutting down...
+```
+这个测试执行非常耗CPU资源，一小会儿工夫，我的Mac Pro的风扇就开始呼呼转动起来了。不过submit包的Unpack函数并未在这次短暂运行的模糊测试中发现问题，crashers后面的数值一直是0。
+
+为了演示被测代码在模糊测试中崩溃的情况，这里再举一个例子（例子代码改编自https://github.com/fuzzitdev/example-go）。在这个示例用，被测代码如下：
+
+```go
+// chapter8/sources/fuzz-test-demo/parse_complex.go
+package parser
+
+func ParseComplex(data [] byte) bool {
+    if len(data) == 5 {
+        if data[0] == 'F' && data[1] == 'U' &&
+            data[2] == 'Z' && data[3] == 'Z' &&
+            data[4] == 'I' && data[5] == 'T' {
+            return true
+        }
+    }
+    return false
+}
+```
+为上述被测目标建立模糊测试：
+```go
+// chapter8/sources/fuzz-test-demo/parse_complex_fuzz.go
+
+// +build gofuzz
+package parser
+
+func Fuzz(data []byte) int {
+    ParseComplex(data)
+    return 0
+}
+```
+接下来按照套路，使用go-fuzz-build构建go-fuzz使用的二进制zip文件并运行go-fuzz：
+```sh
+$go-fuzz-build github.com/bigwhite/fuzz-test-demo
+$go-fuzz -bin=./parser-fuzz.zip -workdir=./
+2020/05/07 16:10:00 workers: 8, corpus: 6 (2s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 3s
+2020/05/07 16:10:03 workers: 8, corpus: 6 (5s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 10, uptime: 6s
+2020/05/07 16:10:06 workers: 8, corpus: 6 (8s ago), crashers: 1, restarts: 1/5219, execs: 198330 (22034/sec), cover: 10, uptime: 9s
+2020/05/07 16:10:09 workers: 8, corpus: 6 (11s ago), crashers: 1, restarts: 1/5051, execs: 383950 (31993/sec), cover: 10, uptime: 12s
+2020/05/07 16:10:12 workers: 8, corpus: 6 (14s ago), crashers: 1, restarts: 1/5132, execs: 523514 (34898/sec), cover: 10, uptime: 15s
+2020/05/07 16:10:15 workers: 8, corpus: 6 (17s ago), crashers: 1, restarts: 1/4930, execs: 631139 (35061/sec), cover: 10, uptime: 18s
+^C2020/05/07 16:10:16 shutting down...
+```
+我们看到，在这次模糊测试执行的输出中，crashers的计数不再是0，而是1，这表明模糊测试引发了一次被测目标的崩溃。停掉模糊测试后，我们看到在测试执行的工作目录下出现了crashers和suppressions这两个目录：
+```sh
+$tree
+.
+├── corpus
+│  ├── 1b7c3c5fec431a18fdebaa415d1f89a8f7a325bd-4
+...
+├── crashers
+│  ├── df779ced6b712c5fca247e465de2de474d1d23b9
+│  ├── df779ced6b712c5fca247e465de2de474d1d23b9.output
+│  └── df779ced6b712c5fca247e465de2de474d1d23b9.quoted
+...
+├── go.mod
+├── parse_complex.go
+├── parse_complex_fuzz.go
+├── parser-fuzz.zip
+└── suppressions
+  └── 4db970443bac2de13454771685ab603e779152b4
+```
+我们分别看看crashers和suppressions这两个目录下的内容：
+```sh
+// suppressions目录下的文件内容
+$ cat suppressions/4db970443bac2de13454771685ab603e779152b4
+panic: runtime error: index out of range [5] with length 5
+github.com/bigwhite/fuzz-test-demo.ParseComplex.func5
+github.com/bigwhite/fuzz-test-demo.ParseComplex
+github.com/bigwhite/fuzz-test-demo.Fuzz
+go-fuzz-dep.Main
+main.main
+
+// crashers目录下的文件内容
+
+$cat crashers/df779ced6b712c5fca247e465de2de474d1d23b9
+FUZZI
+
+$cat crashers/df779ced6b712c5fca247e465de2de474d1d23b9.quoted
+    "FUZZI"
+
+cat crashers/df779ced6b712c5fca247e465de2de474d1d23b9.output
+panic: runtime error: index out of range [5] with length 5
+
+goroutine 1 [running]:
+github.com/bigwhite/fuzz-test-demo.ParseComplex.func5(...)
+    chapter8/sources/fuzz-test-demo/parse_complex.go:5
+github.com/bigwhite/fuzz-test-demo.ParseComplex(0x28a21000, 0x5, 0x5,
+    0x3bd-475a562627)
+    chapter8/sources/fuzz-test-demo/parse_complex.go:5 +0x1be
+github.com/bigwhite/fuzz-test-demo.Fuzz(0x28a21000, 0x5, 0x5, 0x3)
+    chapter8/sources/fuzz-test-demo/parse_complex_fuzz.go:6 +0x57
+go-fuzz-dep.Main(0xc000104f70, 0x1, 0x1)
+    go-fuzz-dep/main.go:36 +0x1ad
+main.main()
+    github.com/bigwhite/fuzz-test-demo/go.fuzz.main/main.go:15 +0x52
+exit status 2
+```
+从crashers/xxx.quoted中我们可以看到，引发此次崩溃的输入数据为"FUZZI"这个字符串；从crashers/xxx.output或suppressions/4db970443bac2de13454771685ab603e779152b4我们可以看到，导致崩溃的直接原因为“下标越界”。这些信息足以让我们快速定位到bug的位置：
+```sh
+data[5] == 'T'
+```
+接下来，我们可以修复该bug（可以将if len(data) == 5改为if len(data) == 6），并在该包的单元测试文件中添加一个针对该崩溃的用例，这里就不再赘述了。
+
+#### 45.5　让模糊测试成为“一等公民”
+
+go-fuzz的成功和广泛应用让Gopher认识到模糊测试对挖掘潜在bug、提升代码质量有着重要的作用。但目前Go尚未将模糊测试当成“一等公民”对待，即还没有在Go工具链上原生支持模糊测试，模糊测试在Go中的应用还仅限于使用第三方的go-fuzz或谷歌开源的gofuzz。
+
+但当前的go-fuzz等工具的实现存在一些无法解决的问题[1]，比如：
+```
+go-fuzz模仿Go工具构建逻辑，一旦Go原生工具构建逻辑发生变化，就会导致go-fuzz-build不断损坏；go-fuzz-build无法处理cgo，很难实现；目前的代码覆盖率工具（coverage）是通过在源码中插入桩代码实现的，这使其很难与其他构建系统（build system）集成；基于从源码到源码的转换无法处理所有情况，并且转换功能有限，某些代码模式可能会处理不当或导致构建失败；使用从源码到源码转换的方法产生的代码运行很慢。
+```
+这些问题需要编译器层面的支持，也就是在编译器层面添加支持模糊测试的基础设施（比如代码覆盖率桩的插入）。同时，如果模糊测试能像go test、go test -bench那样直接通过Go工具链执行（比如gotest -fuzz=.），模糊测试代码能像普通单元测试代码那样直接编写在*_test.go文件中，像下面这样：
+```go
+// xxx_test.go
+
+func FuzzXxx(f *testing.F, data []byte) {
+    // ...
+}
+```
+那么模糊测试才算真正得到了“一等公民”的地位，这一直是模糊测试在Go语言中的努力方向。目前Go官方已经在讨论将模糊测试纳入Go工具链的实现方案了（https://github.com/golang/go/issues/19109）。
+
+小结
+
+通过这一条，我们认识到模糊测试对于提升Go代码质量、挖掘潜在bug的重要作用。但模糊测试不是“银弹”，它有其适用的范围。模糊测试最适合那些处理复杂输入数据的程序，比如文件格式解析、网络协议解析、人机交互界面入口等。模糊测试是软件测试技术的一个重要分支，与单元测试等互为补充，相辅相成。
+
+目前，并非所有编程语言都有对模糊测试工具的支持，Gopher和Go社区很幸运，Dmitry Vyukov为我们带来了go-fuzz模糊测试工具。如果你是追求高质量Go代码的开发者，请为你的Go代码建立起模糊测试。
+
+[1]https://github.com/golang/go/issues/14565
+
+## 第46条 为被测对象建立性能基准
+著名计算机科学家、《计算机程序设计艺术》的作者高德纳曾说过：“过早优化是万恶之源。”这一名言长久以来被很多开发者奉为圭臬。而关于这句名言的解读也像“编程语言战争”一样成为程序员界的常设话题。
+
+笔者认为之所以对这句话的解读出现“见仁见智”的情况，是因为这句话本身缺少上下文：
+
+```
+被优化的对象是什么类型的程序？
+优化什么？设计、性能、资源占用还是……？
+优化的指标是什么？
+```
+同开发者看问题的视角不同，所处的上下文不同，得出的解读自然也不会相同。Android界开源大牛Jake Wharton就曾提出过这样一个观点：“过早的引用‘过早优化是万恶之源’是一切龟速软件之源。”
+
+是否优化、何时优化实质上是一个决策问题，但决策不能靠直觉，要靠数据说话。借用上面名言中的句型：没有数据支撑的过早决策是万恶之源。
+
+Go语言最初被其设计者们定位为“系统级编程语言”，这说明高性能一直是Go核心团队的目标之一。很多来自动态类型语言的开发者转到Go语言显然也是为了性能（相对于动态类型语言），Gopher期望Go核心团队对Go GC的持续优化也都是出于对性能关注的表现。性能优化也是优化的一种，作为一名Go开发者，我们该如何做出是否对代码进行性能优化的决策呢？可以通过为被测对象建立性能基准的方式去获得决策是否优化的支撑数据，同时可以根据这些性能基准数据判断出对代码所做的任何更改是否对代码性能有所影响。
+
+### 46.1　性能基准测试在Go语言中是“一等公民”
+
+在前文中，我们已经接触过许多性能基准测试。和上一条所讲的模糊测试的境遇不同，性能基准测试在Go语言中是和普通的单元测试一样被原生支持的，得到的是“一等公民”的待遇。我们可以像对普通单元测试那样在*_test.go文件中创建被测对象的性能基准测试，每个以Benchmark前缀开头的函数都会被当作一个独立的性能基准测试：
+
+```go
+func BenchmarkXxx(b *testing.B) {
+    //...
+}
+```
+下面是一个对多种字符串连接方法的性能基准测试（改编自第15条）：
+```go
+// chapter8/sources/benchmark_intro_test.go
+
+var sl = []string{
+    "Rob Pike ",
+    "Robert Griesemer ",
+    "Ken Thompson ",
+}
+
+func concatStringByOperator(sl []string) string {
+    var s string
+    for _, v := range sl {
+        s += v
+    }
+    return s
+}
+
+func concatStringBySprintf(sl []string) string {
+    var s string
+    for _, v := range sl {
+        s = fmt.Sprintf("%s%s", s, v)
+    }
+    return s
+}
+
+func concatStringByJoin(sl []string) string {
+    return strings.Join(sl, "")
+}
+
+func BenchmarkConcatStringByOperator(b *testing.B) {
+    for n := 0; n < b.N; n++ {
+        concatStringByOperator(sl)
+    }
+}
+
+func BenchmarkConcatStringBySprintf(b *testing.B) {
+    for n := 0; n < b.N; n++ {
+        concatStringBySprintf(sl)
+    }
+}
+
+func BenchmarkConcatStringByJoin(b *testing.B) {
+    for n := 0; n < b.N; n++ {
+        concatStringByJoin(sl)
+    }
+}
+```
+上面的源文件中定义了三个性能基准测试：BenchmarkConcatStringByOperator、Benchmark-ConcatStringBySprintf和BenchmarkConcatStringByJoin。我们可以一起运行这三个基准测试：
+```sh
+$go test -bench . benchmark_intro_test.go
+goos: darwin
+goarch: amd64
+BenchmarkConcatStringByOperator-8       12810092            88.5 ns/op
+BenchmarkConcatStringBySprintf-8         2777902             432 ns/op
+BenchmarkConcatStringByJoin-8           23994218            49.7 ns/op
+PASS
+ok         command-line-arguments 4.117s
+```
+也可以通过正则匹配选择其中一个或几个运行：
+```sh
+$go test -bench=ByJoin ./benchmark_intro_test.go
+goos: darwin
+goarch: amd64
+BenchmarkConcatStringByJoin-8     23429586            49.1 ns/op
+PASS
+ok         command-line-arguments 1.209s
+```
+我们关注的是go test输出结果中第三列的那个值。以BenchmarkConcatStringByJoin为例，其第三列的值为49.1ns/op，该值表示BenchmarkConcatStringByJoin这个基准测试中for循环的每次循环平均执行时间为49.1 ns（op代表每次循环操作）。这里for循环调用的是concatStringByJoin，即执行一次concatStringByJoin的平均时长为49.1 ns。
+
+性能基准测试还可以通过传入-benchmem命令行参数输出内存分配信息（与基准测试代码中显式调用b.ReportAllocs的效果是等价的）：
+```sh
+$go test -bench=Join ./benchmark_intro_test.go -benchmem
+goos: darwin
+goarch: amd64
+BenchmarkConcatStringByJoin-8     23004709   48.8 ns/op   48 B/op     1 allocs/op
+PASS
+ok         command-line-arguments 1.183s
+```
+这里输出的内存分配信息告诉我们，每执行一次concatStringByJoin平均进行一次内存分配，每次平均分配48字节的数据。
+### 46.2　顺序执行和并行执行的性能基准测试
+根据是否并行执行，Go的性能基准测试可以分为两类：顺序执行的性能基准测试和并行执行的性能基准测试。
+
+1. 顺序执行的性能基准测试
+```go
+func BenchmarkXxx(b *testing.B) {
+    // ...
+    for i := 0; i < b.N; i++ {
+        // 被测对象的执行代码
+    }
+}
+```
+前面对多种字符串连接方法的性能基准测试就归属于这一类。关于顺序执行的性能基准测试的执行过程原理，可以通过下面的例子来说明：
+```go
+// chapter8/sources/benchmark-impl/sequential_test.go
+var (
+    m     map[int64]struct{} = make(map[int64]struct{}, 10)
+    mu    sync.Mutex
+    round int64 = 1
+)
+
+func BenchmarkSequential(b *testing.B) {
+    fmt.Printf("\ngoroutine[%d] enter BenchmarkSequential: round[%d], b.N[%d]\n",
+           tls.ID(), atomic.LoadInt64(&round), b.N)
+    defer func() {
+        atomic.AddInt64(&round, 1)
+    }()
+
+    for i := 0; i < b.N; i++ {
+        mu.Lock()
+        _, ok := m[round]
+        if !ok {
+            m[round] = struct{}{}
+            fmt.Printf("goroutine[%d] enter loop in BenchmarkSequential: round[%d], b.N[%d]\n",
+                tls.ID(), atomic.LoadInt64(&round), b.N)
+        }
+        mu.Unlock()
+    }
+    fmt.Printf("goroutine[%d] exit BenchmarkSequential: round[%d], b.N[%d]\n",
+           tls.ID(), atomic.LoadInt64(&round), b.N)
+}
+```
+运行这个例子：
+```sh
+$go test -bench . sequential_test.go
+
+goroutine[1] enter BenchmarkSequential: round[1], b.N[1]
+goroutine[1] enter loop in BenchmarkSequential: round[1], b.N[1]
+goroutine[1] exit BenchmarkSequential: round[1], b.N[1]
+goos: darwin
+goarch: amd64
+BenchmarkSequential-8
+goroutine[2] enter BenchmarkSequential: round[2], b.N[100]
+goroutine[2] enter loop in BenchmarkSequential: round[2], b.N[100]
+goroutine[2] exit BenchmarkSequential: round[2], b.N[100]
+goroutine[2] enter BenchmarkSequential: round[3], b.N[10000]
+goroutine[2] enter loop in BenchmarkSequential: round[3], b.N[10000]
+goroutine[2] exit BenchmarkSequential: round[3], b.N[10000]
+
+goroutine[2] enter BenchmarkSequential: round[4], b.N[1000000]
+goroutine[2] enter loop in BenchmarkSequential: round[4], b.N[1000000]
+goroutine[2] exit BenchmarkSequential: round[4], b.N[1000000]
+
+goroutine[2] enter BenchmarkSequential: round[5], b.N[65666582]
+goroutine[2] enter loop in BenchmarkSequential: round[5], b.N[65666582]
+goroutine[2] exit BenchmarkSequential: round[5], b.N[65666582]
+65666582           20.6 ns/op
+PASS
+ok         command-line-arguments 1.381s
+```
+我们看到：
+```
+BenchmarkSequential被执行了多轮（见输出结果中的round值）；
+每一轮执行，for循环的b.N值均不相同，依次为1、100、10000、1000000和65666582；
+除b.N为1的首轮，其余各轮均在一个goroutine（goroutine[2]）中顺序执行。
+```
+默认情况下，每个性能基准测试函数（如BenchmarkSequential）的执行时间为1秒。如果执行一轮所消耗的时间不足1秒，那么go test会按就近的顺序增加b.N的值：1、2、3、5、10、20、30、50、100等。如果当b.N较小时，基准测试执行可以很快完成，那么go test基准测试框架将跳过中间的一些值，选择较大的值，比如像这里b.N从1直接跳到100。选定新的b.N之后，go test基准测试框架会启动新一轮性能基准测试函数的执行，直到某一轮执行所消耗的时间超出1秒。上面例子中最后一轮的b.N值为65666582，这个值应该是go test根据上一轮执行后得到的每次循环平均执行时间计算出来的。go test发现，如果将上一轮每次循环平均执行时间与再扩大100倍的N值相乘，那么下一轮的执行时间会超出1秒很多，于是go test用1秒与上一轮每次循环平均执行时间一起估算出一个循环次数，即上面的65666582。
+
+如果基准测试仅运行1秒，且在这1秒内仅运行10轮迭代，那么这些基准测试运行所得的平均值可能会有较高的标准偏差。如果基准测试运行了数百万或数十亿次迭代，那么其所得平均值可能趋于准确。要增加迭代次数，可以使用-benchtime命令行选项来增加基准测试执行的时间。
+
+下面的例子中，我们通过go test的命令行参数-benchtime将1秒这个默认性能基准测试函数执行时间改为2秒：
+```sh
+$go test -bench . sequential_test.go -benchtime 2s
+...
+
+goroutine[2] enter BenchmarkSequential: round[4], b.N[1000000]
+goroutine[2] enter loop in BenchmarkSequential: round[4], b.N[1000000]
+goroutine[2] exit BenchmarkSequential: round[4], b.N[1000000]
+
+goroutine[2] enter BenchmarkSequential: round[5], b.N[100000000]
+goroutine[2] enter loop in BenchmarkSequential: round[5], b.N[100000000]
+goroutine[2] exit BenchmarkSequential: round[5], b.N[100000000]
+100000000          20.5 ns/op
+PASS
+ok         command-line-arguments 2.075s
+```
+我们看到性能基准测试函数执行时间改为2秒后，最终轮的b.N的值可以增大到100000000。也可以通过-benchtime手动指定b.N的值，这样go test就会以你指定的N值作为最终轮的循环次数：
+```sh
+$go test -v -benchtime 5x -bench . sequential_test.go
+goos: darwin
+goarch: amd64
+BenchmarkSequential
+
+goroutine[1] enter BenchmarkSequential: round[1], b.N[1]
+goroutine[1] enter loop in BenchmarkSequential: round[1], b.N[1]
+goroutine[1] exit BenchmarkSequential: round[1], b.N[1]
+
+goroutine[2] enter BenchmarkSequential: round[2], b.N[5]
+goroutine[2] enter loop in BenchmarkSequential: round[2], b.N[5]
+goroutine[2] exit BenchmarkSequential: round[2], b.N[5]
+BenchmarkSequential-8            5             5470 ns/op
+PASS
+ok        command-line-arguments 0.006s
+```
+上面的每个性能基准测试函数（如BenchmarkSequential）虽然实际执行了多轮，但也仅算一次执行。有时候考虑到性能基准测试单次执行的数据不具代表性，我们可能会显式要求go test多次执行以收集多次数据，并将这些数据经过统计学方法处理后的结果作为最终结果。通过-count命令行选项可以显式指定每个性能基准测试函数执行次数：
+```sh
+$go test -v -count 2 -bench . benchmark_intro_test.go
+goos: darwin
+goarch: amd64
+BenchmarkConcatStringByOperator
+BenchmarkConcatStringByOperator-8       12665250            89.8 ns/op
+BenchmarkConcatStringByOperator-8       13099075            89.7 ns/op
+BenchmarkConcatStringBySprintf
+BenchmarkConcatStringBySprintf-8         2781075             433 ns/op
+BenchmarkConcatStringBySprintf-8         2662507             433 ns/op
+BenchmarkConcatStringByJoin
+BenchmarkConcatStringByJoin-8           23679480            49.1 ns/op
+BenchmarkConcatStringByJoin-8           24135014            49.6 ns/op
+PASS
+ok         command-line-arguments 8.225s
+```
+上面的例子中每个性能基准测试函数都被执行了两次（当然每次执行实质上都会运行多轮，b.N不同），输出了两个结果。
+
+#### 2. 并行执行的性能基准测试
+
+并行执行的性能基准测试的代码写法如下：
+```go
+func BenchmarkXxx(b *testing.B) {
+    // ...
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            // 被测对象的执行代码
+        }
+    }
+}
+```
+并行执行的基准测试主要用于为包含多goroutine同步设施（如互斥锁、读写锁、原子操作等）的被测代码建立性能基准。相比于顺序执行的基准测试，并行执行的基准测试更能真实反映出多goroutine情况下，被测代码在goroutine同步上的真实消耗。比如下面这个例子：
+```go
+// chapter8/sources/benchmark_paralell_demo_test.go
+
+var n1 int64
+
+func addSyncByAtomic(delta int64) int64 {
+    return atomic.AddInt64(&n1, delta)
+}
+
+func readSyncByAtomic() int64 {
+    return atomic.LoadInt64(&n1)
+}
+
+var n2 int64
+var rwmu sync.RWMutex
+
+func addSyncByMutex(delta int64) {
+    rwmu.Lock()
+    n2 += delta
+    rwmu.Unlock()
+}
+
+func readSyncByMutex() int64 {
+    var n int64
+    rwmu.RLock()
+    n = n2
+    rwmu.RUnlock()
+    return n
+}
+
+func BenchmarkAddSyncByAtomic(b *testing.B) {
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            addSyncByAtomic(1)
+        }
+    })
+}
+
+func BenchmarkReadSyncByAtomic(b *testing.B) {
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            readSyncByAtomic()
+        }
+    })
+}
+
+func BenchmarkAddSyncByMutex(b *testing.B) {
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            addSyncByMutex(1)
+        }
+    })
+}
+
+func BenchmarkReadSyncByMutex(b *testing.B) {
+    b.RunParallel(func(pb *testing.PB) {
+        for pb.Next() {
+            readSyncByMutex()
+        }
+    })
+}
+```
+运行该性能基准测试：
+```sh
+$go test -v -bench . benchmark_paralell_demo_test.go -cpu 2,4,8
+goos: darwin
+goarch: amd64
+BenchmarkAddSyncByAtomic
+BenchmarkAddSyncByAtomic-2        75208119              15.3 ns/op
+BenchmarkAddSyncByAtomic-4        70117809              17.0 ns/op
+BenchmarkAddSyncByAtomic-8        68664270              15.9 ns/op
+BenchmarkReadSyncByAtomic
+BenchmarkReadSyncByAtomic-2       1000000000           0.744 ns/op
+BenchmarkReadSyncByAtomic-4       1000000000           0.384 ns/op
+BenchmarkReadSyncByAtomic-8       1000000000           0.240 ns/op
+BenchmarkAddSyncByMutex
+BenchmarkAddSyncByMutex-2         37533390              31.4 ns/op
+BenchmarkAddSyncByMutex-4         21660948              57.5 ns/op
+BenchmarkAddSyncByMutex-8         16808721              72.6 ns/op
+BenchmarkReadSyncByMutex
+BenchmarkReadSyncByMutex-2        35535615              32.3 ns/op
+BenchmarkReadSyncByMutex-4        29839219              39.6 ns/op
+BenchmarkReadSyncByMutex-8        29936805              39.8 ns/op
+PASS
+ok         command-line-arguments 12.454s
+```
+上面的例子中通过-cpu 2,4,8命令行选项告知go test将每个性能基准测试函数分别在GOMAXPROCS等于2、4、8的情况下各运行一次。从测试的输出结果，我们可以很容易地看出不同被测函数的性能随着GOMAXPROCS增大之后的性能变化情况。
+
+和顺序执行的性能基准测试不同，并行执行的性能基准测试会启动多个goroutine并行执行基准测试函数中的循环。这里也用一个例子来说明一下其执行流程：
+```go
+// chapter8/sources/benchmark-impl/paralell_test.go
+var (
+    m     map[int64]int = make(map[int64]int, 20)
+    mu    sync.Mutex
+    round int64 = 1
+)
+
+func BenchmarkParalell(b *testing.B) {
+    fmt.Printf("\ngoroutine[%d] enter BenchmarkParalell: round[%d], b.N[%d]\n",
+           tls.ID(), atomic.LoadInt64(&round), b.N)
+    defer func() {
+        atomic.AddInt64(&round, 1)
+    }()
+
+    b.RunParallel(func(pb *testing.PB) {
+        id := tls.ID()
+        fmt.Printf("goroutine[%d] enter loop func in BenchmarkParalell: round[%d], b.N[%d]\n", tls.ID(), atomic.LoadInt64(&round), b.N)
+        for pb.Next() {
+            mu.Lock()
+            _, ok := m[id]
+            if !ok {
+                m[id] = 1
+            } else {
+                m[id] = m[id] + 1
+            }
+            mu.Unlock()
+        }
+
+        mu.Lock()
+        count := m[id]
+        mu.Unlock()
+
+        fmt.Printf("goroutine[%d] exit loop func in BenchmarkParalell: round[%d], loop[%d]\n", tls.ID(), atomic.LoadInt64(&round), count)
+    })
+
+    fmt.Printf("goroutine[%d] exit BenchmarkParalell: round[%d], b.N[%d]\n",
+        tls.ID(), atomic.LoadInt64(&round), b.N)
+}
+```
+以-cpu=2运行该例子：
+```sh
+$go test -v  -bench . paralell_test.go -cpu=2
+goos: darwin
+goarch: amd64
+BenchmarkParalell
+
+goroutine[1] enter BenchmarkParalell: round[1], b.N[1]
+goroutine[2] enter loop func in BenchmarkParalell: round[1], b.N[1]
+goroutine[2] exit loop func in BenchmarkParalell: round[1], loop[1]
+goroutine[3] enter loop func in BenchmarkParalell: round[1], b.N[1]
+goroutine[3] exit loop func in BenchmarkParalell: round[1], loop[0]
+goroutine[1] exit BenchmarkParalell: round[1], b.N[1]
+
+goroutine[4] enter BenchmarkParalell: round[2], b.N[100]
+goroutine[5] enter loop func in BenchmarkParalell: round[2], b.N[100]
+goroutine[5] exit loop func in BenchmarkParalell: round[2], loop[100]
+goroutine[6] enter loop func in BenchmarkParalell: round[2], b.N[100]
+goroutine[6] exit loop func in BenchmarkParalell: round[2], loop[0]
+goroutine[4] exit BenchmarkParalell: round[2], b.N[100]
+
+goroutine[4] enter BenchmarkParalell: round[3], b.N[10000]
+goroutine[7] enter loop func in BenchmarkParalell: round[3], b.N[10000]
+goroutine[8] enter loop func in BenchmarkParalell: round[3], b.N[10000]
+goroutine[8] exit loop func in BenchmarkParalell: round[3], loop[4576]
+goroutine[7] exit loop func in BenchmarkParalell: round[3], loop[5424]
+goroutine[4] exit BenchmarkParalell: round[3], b.N[10000]
+
+goroutine[4] enter BenchmarkParalell: round[4], b.N[1000000]
+goroutine[9] enter loop func in BenchmarkParalell: round[4], b.N[1000000]
+goroutine[10] enter loop func in BenchmarkParalell: round[4], b.N[1000000]
+goroutine[9] exit loop func in BenchmarkParalell: round[4], loop[478750]
+goroutine[10] exit loop func in BenchmarkParalell: round[4], loop[521250]
+goroutine[4] exit BenchmarkParalell: round[4], b.N[1000000]
+
+goroutine[4] enter BenchmarkParalell: round[5], b.N[25717561]
+goroutine[11] enter loop func in BenchmarkParalell: round[5], b.N[25717561]
+goroutine[12] enter loop func in BenchmarkParalell: round[5], b.N[25717561]
+goroutine[12] exit loop func in BenchmarkParalell: round[5], loop[11651491]
+goroutine[11] exit loop func in BenchmarkParalell: round[5], loop[14066070]
+goroutine[4] exit BenchmarkParalell: round[5], b.N[25717561]
+BenchmarkParalell-2       25717561               43.6 ns/op
+PASS
+ok         command-line-arguments 1.176s
+```
+我们看到，针对BenchmarkParalell基准测试的每一轮执行，go test都会启动GOMAXPROCS数量的新goroutine，这些goroutine共同执行b.N次循环，每个goroutine会尽量相对均衡地分担循环次数。
+
+#### 46.3　使用性能基准比较工具
+
+现在我们已经可以通过Go原生提供的性能基准测试为被测对象建立性能基准了。但被测代码更新前后的性能基准比较依然要靠人工计算和肉眼比对，十分不方便。为此，Go核心团队先后开发了两款性能基准比较工具：benchcmp（https://github.com/golang/tools/tree/master/cmd/benchcmp）和benchstat（https://github.com/golang/perf/tree/master/benchstat）。
+
+##### 1. benchcmp
+benchcmp上手快，简单易用，对于输出的比较结果我们无须参考文档帮助即可自行解读。下面看一个使用benchcmp进行性能基准比较的例子。
+```go
+// chapter8/sources/benchmark-compare/strcat_test.go
+
+var sl = []string{
+    "Rob Pike ",
+    "Robert Griesemer ",
+    "Ken Thompson ",
+}
+
+func Strcat(sl []string) string {
+    return concatStringByOperator(sl)
+}
+
+func concatStringByOperator(sl []string) string {
+    var s string
+    for _, v := range sl {
+        s += v
+    }
+    return s
+}
+
+func concatStringByJoin(sl []string) string {
+    return strings.Join(sl, "")
+}
+
+func BenchmarkStrcat(b *testing.B) {
+    for n := 0; n < b.N; n++ {
+        Strcat(sl)
+    }
+}
+```
+上面例子中的被测目标为Strcat。最初Strcat使用通过Go原生的操作符（"+"）连接的方式实现了字符串的连接。我们采集一下它的性能基准数据：
+```sh
+$go test -run=NONE -bench . strcat_test.go > old.txt
+```
+然后，升级Strcat的实现，采用strings.Join函数来实现多个字符串的连接：
+```go
+func Strcat(sl []string) string {
+    return concatStringByJoin(sl)
+}
+```
+再采集优化后的性能基准数据：
+```sh
+$go test -run=NONE -bench . strcat_test.go > new.txt
+```
+接下来就轮到benchcmp登场了：
+```sh
+$benchcmp old.txt new.txt
+benchmark             old ns/op     new ns/op     delta
+BenchmarkStrcat-8     92.4          49.6          -46.32%
+```
+我们看到，benchcmp接受被测代码更新前后的两次性能基准测试结果文件——old.txt和new.txt，并将这两个文件中的相同基准测试（比如这里的BenchmarkStrcat）的输出结果进行比较。
+
+如果使用-count对BenchmarkStrcat执行多次，那么benchcmp给出的结果如下：
+```sh
+$go test -run=NONE -count 5 -bench . strcat_test.go > old.txt
+$go test -run=NONE -count 5 -bench . strcat_test.go > new.txt
+
+$benchcmp old.txt new.txt
+benchmark             old ns/op     new ns/op     delta
+BenchmarkStrcat-8     92.8          51.4          -44.61%
+BenchmarkStrcat-8     91.9          55.3          -39.83%
+BenchmarkStrcat-8     96.1          52.6          -45.27%
+BenchmarkStrcat-8     89.4          50.2          -43.85%
+BenchmarkStrcat-8     91.2          51.5          -43.53%
+```
+如果向benchcmp传入-best命令行选项，benchcmp将分别从old.txt和new.txt中挑选性能最好的一条数据，然后进行比较：
+```sh
+$benchcmp -best old.txt new.txt
+benchmark             old ns/op     new ns/op     delta
+BenchmarkStrcat-8     89.4          50.2          -43.85%
+```
+benchcmp还可以按性能基准数据前后变化的大小对输出结果进行排序（通过-mag命令行选项）：
+```sh
+$benchcmp -mag old.txt new.txt
+benchmark             old ns/op     new ns/op     delta
+BenchmarkStrcat-8     96.1          52.6          -45.27%
+BenchmarkStrcat-8     92.8          51.4          -44.61%
+BenchmarkStrcat-8     89.4          50.2          -43.85%
+BenchmarkStrcat-8     91.2          51.5          -43.53%
+BenchmarkStrcat-8     91.9          55.3          -39.83%
+```
+不过性能基准测试的输出结果受到很多因素的影响，比如：同一测试的运行次数；性能基准测试与其他正在运行的程序共享一台机器；运行测试的系统本身就在虚拟机上，与其他虚拟机共享硬件；现代机器的一些节能和功率缩放（比如CPU的自动降频和睿频）等。这些因素都会造成即便是对同一个基准测试进行多次运行，输出的结果也可能有较大偏差。但benchcmp工具并不关心这些结果数据在统计学层面是否有效，只对结果做简单比较。
+##### 2. benchstat
+为了提高对性能基准数据比较的科学性，Go核心团队又开发了benchstat这款工具以替代benchcmp。下面用benchstat比较一下上面例子中的性能基准数据：
+```sh
+$benchstat old.txt new.txt
+name      old time/op    new time/op   delta
+Strcat-8  92.3ns ± 4%   52.2ns ± 6%   -43.43%  (p=0.008 n=5+5)
+```
+我们看到，即便old.txt和new.txt中各自有5次运行的数据，benchstat也不会像benchcmp那样输出5行比较结果，而是输出一行经过统计学方法处理后的比较结果。以第二列数据92.3ns ± 4%为例，这是benchcmp对old.txt中的数据进行处理后的结果，其中±4%是样本数据中最大值和最小值距样本平均值的最大偏差百分比。如果这个偏差百分比大于5%，则说明样本数据质量不佳，有些样本数据是不可信的。由此可以看出，这里new.txt中的样本数据是质量不佳的.
+
+benchstat输出结果的最后一列（delta）为两次基准测试对比的变化量。我们看到，采用strings.Join方法连接字符串的平均耗时比采用原生操作符连接字符串短43%，这个指标后面括号中的p=0.008是一个用于衡量两个样本集合的均值是否有显著差异的指标。benchstat支持两种检验算法：一种是UTest（Mann Whitney UTest，曼-惠特尼U检验），UTest是默认的检验算法；另外一种是Welch T检验（TTest）。一般p值小于0.05的结果是可接受的。
+
+上述两款工具都支持对内存分配数据情况的前后比较，这里以benchstat为例：
+
+```sh
+$go test -run=NONE -count 5 -bench . strcat_test.go -benchmem > old_with_mem.txt
+$go test -run=NONE -count 5 -bench . strcat_test.go -benchmem > new_with_mem.txt
+
+$benchstat old_with_mem.txt new_with_mem.txt
+name      old time/op    new time/op    delta
+Strcat-8    90.5ns ± 1%    50.6ns ± 2%  -44.14%  (p=0.008 n=5+5)
+
+name      old alloc/op   new alloc/op   delta
+Strcat-8     80.0B ± 0%     48.0B ± 0%  -40.00%  (p=0.008 n=5+5)
+
+name      old allocs/op  new allocs/op  delta
+Strcat-8      2.00 ± 0%      1.00 ± 0%  -50.00%  (p=0.008 n=5+5)
+```
+关于内存分配情况对比的输出独立于执行时间的输出，但结构上是一致的（输出列含义相同），这里就不再赘述了。
+
+Go核心团队已经给benchcmp工具打上了“deprecation”（不建议使用）的标签，因此建议大家使用benchstat来进行性能基准数据的比较。
+
+### 46.4　排除额外干扰，让基准测试更精确
+
+从前面对顺序执行和并行执行的性能基准测试原理的介绍可知，每个基准测试都可能会运行多轮，每个BenchmarkXxx函数都可能会被执行多次。有些复杂的基准测试在真正执行For循环之前或者在每个循环中，除了执行真正的被测代码之外，可能还需要做一些测试准备工作，比如建立基准测试所需的测试上下文等。如果不做特殊处理，这些测试准备工作所消耗的时间也会被算入最终结果中，这就会导致最终基准测试的数据受到干扰而不够精确。为此，testing.B中提供了多种灵活操控基准测试计时器的方法，通过这些方法可以排除掉额外干扰，让基准测试结果更能反映被测代码的真实性能。来看一个例子：
+```go
+// chapter8/sources/benchmark_with_expensive_context_setup_test.go
+
+var sl = []string{
+    "Rob Pike ",
+    "Robert Griesemer ",
+    "Ken Thompson ",
+}
+
+func concatStringByJoin(sl []string) string {
+    return strings.Join(sl, "")
+}
+
+func expensiveTestContextSetup() {
+    time.Sleep(200 * time.Millisecond)
+}
+
+func BenchmarkStrcatWithTestContextSetup(b *testing.B) {
+    expensiveTestContextSetup()
+    for n := 0; n < b.N; n++ {
+        concatStringByJoin(sl)
+    }
+}
+
+func BenchmarkStrcatWithTestContextSetupAndResetTimer(b *testing.B) {
+    expensiveTestContextSetup()
+    b.ResetTimer()
+    for n := 0; n < b.N; n++ {
+        concatStringByJoin(sl)
+    }
+}
+
+func BenchmarkStrcatWithTestContextSetupAndRestartTimer(b *testing.B) {
+    b.StopTimer()
+    expensiveTestContextSetup()
+    b.StartTimer()
+    for n := 0; n < b.N; n++ {
+        concatStringByJoin(sl)
+    }
+}
+
+func BenchmarkStrcat(b *testing.B) {
+    for n := 0; n < b.N; n++ {
+        concatStringByJoin(sl)
+    }
+}
+```
+在这个例子中，我们来对比一下不建立测试上下文、建立测试上下文以及在对计时器控制下建立测试上下文等情况下的基准测试数据：
+
+```sh
+$go test -bench . benchmark_with_expensive_context_setup_test.go
+goos: darwin
+goarch: amd64
+BenchmarkStrcatWithTestContextSetup-8                 16943037     65.9 ns/op
+BenchmarkStrcatWithTestContextSetupAndResetTimer-8    21700249     52.7 ns/op
+BenchmarkStrcatWithTestContextSetupAndRestartTimer-8  21628669     50.5 ns/op
+BenchmarkStrcat-8                                     22915291     50.7 ns/op
+PASS
+ok       command-line-arguments 9.838s
+```
+我们看到，如果不通过testing.B提供的计数器控制接口对测试上下文带来的消耗进行隔离，最终基准测试得到的数据（BenchmarkStrcatWithTestContextSetup）将偏离准确数据（BenchmarkStrcat）很远。而通过testing.B提供的计数器控制接口对测试上下文带来的消耗进行隔离后，得到的基准测试数据（BenchmarkStrcatWithTestContextSetupAndResetTimer和Bench-markStrcatWithTestContextSetupAndRestartTimer）则非常接近真实数据
+
+虽然在上面的例子中，ResetTimer和StopTimer/StartTimer组合都能实现对测试上下文带来的消耗进行隔离的目的，但二者是有差别的：ResetTimer并不停掉计时器（无论计时器是否在工作），而是将已消耗的时间、内存分配计数器等全部清零，这样即便计数器依然在工作，它仍然需要从零开始重新记；而StopTimer只是停掉一次基准测试运行的计时器，在调用StartTimer后，计时器即恢复正常工作。
+
+但这样一来，将ResetTimer或StopTimer用在每个基准测试的For循环中是有副作用的。在默认情况下，每个性能基准测试函数的执行时间为1秒。如果执行一轮所消耗的时间不足1秒，那么会修改b.N值并启动新的一轮执行。这样一旦在For循环中使用StopTimer，那么想要真正运行1秒就要等待很长时间；而如果在For循环中使用了ResetTimer，由于其每次执行都会将计数器数据清零，因此这轮基准测试将一直执行下去，无法退出。综上，尽量不要在基准测试的For循环中使用ResetTimer！但可以在限定条件下在For循环中使用StopTimer/StartTimer，就像下面的Go标准库中这样：
+```go
+// $GOROOT/src/runtime/map_test.go
+func benchmarkMapDeleteInt32(b *testing.B, n int) {
+    a := make(map[int32]int, n)
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        if len(a) == 0 {
+            b.StopTimer()
+            for j := i; j < i+n; j++ {
+                a[int32(j)] = j
+            }
+            b.StartTimer()
+        }
+        delete(a, int32(i))
+    }
+}
+```
+上面的测试代码虽然在基准测试的For循环中使用了StopTimer，但其是在iflen(a) == 0这个限定条件下使用的，StopTimer方法并不会在每次循环中都被调用。
+
+小结
+
+无论你是否认为性能很重要，都请你为被测代码（尤其是位于系统关键业务路径上的代码）建立性能基准。如果你编写的是供其他人使用的软件包，则更应如此。只有这样，我们才能至少保证后续对代码的修改不会带来性能回退。已经建立的性能基准可以为后续是否进一步优化的决策提供数据支撑，而不是靠程序员的直觉。
+
+本条要点：
+```
+性能基准测试在Go语言中是“一等公民”，在Go中我们可以很容易为被测代码建立性能基准；
+了解Go的两种性能基准测试的执行原理；
+使用性能比较工具协助解读测试结果数据，优先使用benchstat工具；
+使用testing.B提供的定时器操作方法排除额外干扰，让基准测试更精确，但不要在Run-Parallel中使用ResetTimer、StartTimer和StopTimer，因为它们具有全局副作用。
+```
+
+
